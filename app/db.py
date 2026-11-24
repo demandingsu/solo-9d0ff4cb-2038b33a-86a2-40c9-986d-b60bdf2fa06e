@@ -24,6 +24,8 @@ from .domain import (
     ArrangementModel,
     Blackout,
     Program,
+    Reconciliation,
+    count_matching_arrangements,
     is_solvable,
     load_zone,
     local_naive_to_utc_candidates,
@@ -55,6 +57,14 @@ CREATE TABLE IF NOT EXISTS blackouts (
     PRIMARY KEY (channel_id, blackout_id),
     FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
 );
+CREATE TABLE IF NOT EXISTS reconciliations (
+    channel_id       TEXT PRIMARY KEY,    -- 每频道至多保留一张对账单
+    start_utc        INTEGER NOT NULL,
+    end_utc          INTEGER NOT NULL,
+    on_air_seconds   INTEGER NOT NULL,
+    updated_at       TEXT NOT NULL,
+    FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
+);
 """
 
 
@@ -77,6 +87,14 @@ class Repository:
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.execute("PRAGMA busy_timeout=30000;")
         return conn
+
+    @staticmethod
+    def _rollback(conn: sqlite3.Connection) -> None:
+        """容错回滚：若事务已在别处回滚/提交，则跳过，避免二次 ROLLBACK 报错。"""
+        try:
+            conn.execute("ROLLBACK;")
+        except sqlite3.OperationalError:
+            pass
 
     # ------------------------------------------------------------------ #
     # 模型构造
@@ -132,6 +150,44 @@ class Repository:
         blackouts = tuple(Blackout(r["start_utc"], r["end_utc"]) for r in bl_rows)
         return ArrangementModel(timezone=ch["timezone"], programs=programs, blackouts=blackouts)
 
+    @staticmethod
+    def _read_reconciliation(
+        conn: sqlite3.Connection, channel_id: str
+    ) -> Reconciliation | None:
+        """在当前事务/快照内读取该频道唯一的对账单（无则 None）。"""
+        row = conn.execute(
+            "SELECT start_utc, end_utc, on_air_seconds FROM reconciliations "
+            "WHERE channel_id=?",
+            (channel_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Reconciliation(
+            start=row["start_utc"],
+            end=row["end_utc"],
+            on_air_seconds=row["on_air_seconds"],
+        )
+
+    @staticmethod
+    def _check_state(
+        conn: sqlite3.Connection, model: ArrangementModel, recon: Reconciliation | None
+    ) -> None:
+        """按同一档案状态做写入前校验。
+
+        先保证整档仍有完整排法；若该频道已登记对账单，还必须至少存在一种
+        能对上对账单总秒数的完整排法，否则在当前连接上回滚后抛出，
+        保证「无解即整次退回」、旧档与旧单原封不动。
+        """
+        if not is_solvable(model):
+            conn.execute("ROLLBACK;")
+            raise UnsolvableError("整档不存在任何完整排法，已拒绝并保留旧档")
+        if recon is not None and count_matching_arrangements(model, recon) == 0:
+            conn.execute("ROLLBACK;")
+            raise ReconciliationMismatchError(
+                "当前对账单在新档案状态下没有任何能对上在播总秒数的完整排法，"
+                "已拒绝并保留旧档（可提交新的对账单换单）"
+            )
+
     # ------------------------------------------------------------------ #
     # 读（单一快照事务）
     # ------------------------------------------------------------------ #
@@ -156,6 +212,7 @@ class Repository:
                 "FROM blackouts WHERE channel_id=? ORDER BY start_utc",
                 (channel_id,),
             ).fetchall()
+            recon = self._read_reconciliation(conn, channel_id)
             result = {
                 "channel_id": ch["channel_id"],
                 "timezone": ch["timezone"],
@@ -172,16 +229,27 @@ class Repository:
                     for r in programs
                 ],
                 "blackouts": [dict(r) for r in blackouts],
+                "reconciliation": (
+                    {
+                        "start_utc": recon.start,
+                        "end_utc": recon.end,
+                        "on_air_seconds": recon.on_air_seconds,
+                    }
+                    if recon is not None
+                    else None
+                ),
             }
             conn.execute("COMMIT;")
             return result
 
     def get_model(self, channel_id: str) -> ArrangementModel | None:
-        model, _ = self.get_snapshot(channel_id)
+        model, _version, _recon = self.get_snapshot(channel_id)
         return model
 
-    def get_snapshot(self, channel_id: str) -> tuple[ArrangementModel | None, int | None]:
-        """单快照事务内同时读取模型与版本号，保证二者属于同一份已提交资料。"""
+    def get_snapshot(
+        self, channel_id: str
+    ) -> tuple[ArrangementModel | None, int | None, Reconciliation | None]:
+        """单快照事务内同时读取模型、版本号与对账单，保证三者属于同一份已提交资料。"""
         with self._connect() as conn:
             conn.execute("BEGIN;")
             row = conn.execute(
@@ -189,10 +257,11 @@ class Repository:
             ).fetchone()
             if row is None:
                 conn.execute("ROLLBACK;")
-                return None, None
+                return None, None, None
             model = self._read_model(conn, channel_id)
+            recon = self._read_reconciliation(conn, channel_id)
             conn.execute("COMMIT;")
-            return model, row["version"]
+            return model, row["version"], recon
 
     def get_version(self, channel_id: str) -> int | None:
         with self._connect() as conn:
@@ -239,18 +308,16 @@ class Repository:
                         for p in model.programs
                     ],
                 )
-                # 新日志可能与既有停播段冲突：整档须仍有解，否则回滚保留旧档。
+                # 新日志可能与既有停播段冲突：整档须仍有解；若已登记对账单，
+                # 还须存在对得上总秒数的完整排法，否则回滚保留旧档。
                 model_after = self._read_model(conn, channel_id)
-                if not is_solvable(model_after):
-                    conn.execute("ROLLBACK;")
-                    raise UnsolvableError(
-                        f"新日志与频道 {channel_id} 已登记的停播段冲突，整档无解，已拒绝并保留旧档"
-                    )
+                recon_after = self._read_reconciliation(conn, channel_id)
+                self._check_state(conn, model_after, recon_after)
                 conn.execute("COMMIT;")
-            except UnsolvableError:
+            except (UnsolvableError, ReconciliationMismatchError):
                 raise
             except Exception:
-                conn.execute("ROLLBACK;")
+                self._rollback(conn)
                 raise
         version = self.get_version(channel_id)
         assert version is not None
@@ -276,21 +343,18 @@ class Repository:
                     (channel_id, blackout_id, start_utc, end_utc, note),
                 )
                 model = self._read_model(conn, channel_id)
-                if not is_solvable(model):
-                    conn.execute("ROLLBACK;")
-                    raise UnsolvableError(
-                        f"停播段 {blackout_id} 会使频道 {channel_id} 整档无解，已拒绝并保留旧档"
-                    )
+                recon = self._read_reconciliation(conn, channel_id)
+                self._check_state(conn, model, recon)
                 conn.execute(
                     "UPDATE channels SET version=version+1, "
                     "updated_at=? WHERE channel_id=?",
                     (datetime.utcnow().isoformat(timespec="seconds") + "Z", channel_id),
                 )
                 conn.execute("COMMIT;")
-            except UnsolvableError:
+            except (UnsolvableError, ReconciliationMismatchError):
                 raise
             except Exception:
-                conn.execute("ROLLBACK;")
+                self._rollback(conn)
                 raise
         version = self.get_version(channel_id)
         assert version is not None
@@ -307,14 +371,71 @@ class Repository:
                 if cur.rowcount == 0:
                     conn.execute("ROLLBACK;")
                     raise KeyError(blackout_id)
+                # 删除停播段只会放松约束；仍按同一档案状态复核当前对账单。
+                model = self._read_model(conn, channel_id)
+                recon = self._read_reconciliation(conn, channel_id)
+                self._check_state(conn, model, recon)
                 conn.execute(
                     "UPDATE channels SET version=version+1, "
                     "updated_at=? WHERE channel_id=?",
                     (datetime.utcnow().isoformat(timespec="seconds") + "Z", channel_id),
                 )
                 conn.execute("COMMIT;")
+            except (UnsolvableError, ReconciliationMismatchError):
+                raise
             except Exception:
-                conn.execute("ROLLBACK;")
+                self._rollback(conn)
+                raise
+        version = self.get_version(channel_id)
+        assert version is not None
+        return version
+
+    def upsert_reconciliation(
+        self,
+        channel_id: str,
+        start_utc: int,
+        end_utc: int,
+        on_air_seconds: int,
+    ) -> int:
+        """登记或替换该频道唯一的对账单（换单）。
+
+        在单个 ``IMMEDIATE`` 事务内：写入候选对账单 -> 按同一档案状态（新日志 +
+        既有停播段 + 新对账单）校验是否存在对得上总秒数的完整排法 -> 提交。
+        无解（没有任何完整排法能对上总秒数）或写入失败一律回滚，旧单与旧档
+        原封不动，版本号不增加。
+        """
+        now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        with self._write_lock, self._connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE;")
+                ch = conn.execute(
+                    "SELECT 1 FROM channels WHERE channel_id=?", (channel_id,)
+                ).fetchone()
+                if ch is None:
+                    conn.execute("ROLLBACK;")
+                    raise KeyError(channel_id)
+                conn.execute(
+                    "INSERT INTO reconciliations(channel_id, start_utc, end_utc, "
+                    "on_air_seconds, updated_at) VALUES(?, ?, ?, ?, ?) "
+                    "ON CONFLICT(channel_id) DO UPDATE SET "
+                    "start_utc=excluded.start_utc, end_utc=excluded.end_utc, "
+                    "on_air_seconds=excluded.on_air_seconds, updated_at=excluded.updated_at",
+                    (channel_id, start_utc, end_utc, on_air_seconds, now),
+                )
+                model = self._read_model(conn, channel_id)
+                recon = self._read_reconciliation(conn, channel_id)
+                assert recon is not None
+                self._check_state(conn, model, recon)
+                conn.execute(
+                    "UPDATE channels SET version=version+1, updated_at=? "
+                    "WHERE channel_id=?",
+                    (now, channel_id),
+                )
+                conn.execute("COMMIT;")
+            except (UnsolvableError, ReconciliationMismatchError):
+                raise
+            except Exception:
+                self._rollback(conn)
                 raise
         version = self.get_version(channel_id)
         assert version is not None
@@ -323,6 +444,10 @@ class Repository:
 
 class UnsolvableError(Exception):
     """新资料导致整档不存在任何完整排法。"""
+
+
+class ReconciliationMismatchError(UnsolvableError):
+    """不存在任何能对上当张对账单总秒数的完整排法（无解，整次退回）。"""
 
 
 def p_local_start(rows: list[dict], seq: int) -> str:

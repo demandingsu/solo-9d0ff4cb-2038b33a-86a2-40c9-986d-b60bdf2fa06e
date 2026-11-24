@@ -84,11 +84,28 @@ class ArrangementModel:
     blackouts: tuple[Blackout, ...]
 
 
+@dataclass(frozen=True)
+class Reconciliation:
+    """一张对账单：半开核对窗口 ``[start, end)`` 与监听记录给出的在播总秒数。"""
+
+    start: int
+    end: int
+    on_air_seconds: int
+
+
 # --------------------------------------------------------------------------- #
 # 区间工具（半开：含起点、不含终点）
 # --------------------------------------------------------------------------- #
 def _overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
     return a_start < b_end and b_start < a_end
+
+
+def clipped_length(start: int, duration: int, window_start: int, window_end: int) -> int:
+    """节目时段 ``[start, start+duration)`` 落在窗口 ``[window_start, window_end)``
+    内的秒数（两端都按半开区间裁切，节目只计落在时段内的秒数）。"""
+    lo = max(start, window_start)
+    hi = min(start + duration, window_end)
+    return hi - lo if hi > lo else 0
 
 
 def _hits_blackout(start: int, end: int, blackouts: tuple[Blackout, ...]) -> bool:
@@ -277,4 +294,221 @@ def query_second(model: ArrangementModel, t: int) -> dict:
         "may_be_gap": may_be_gap,
         "in_blackout": in_blackout,
         "arrangement_count": count_arrangements(model),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 对账：只在「对得上监听总秒数」的完整排法子集上做动态规划
+#
+# 一个节目取某个候选时，对窗口 [w_start, w_end) 的在播贡献为
+# clipped_length(...)（窗口外的秒不计）。完整排法的窗口总秒数即各节目贡献
+# 之和；只有总和恰等于监听总秒数 T 的完整排法才参与对账。
+#
+# DP 状态是「前缀/后缀已累计窗口秒数 -> 路径数」的字典：
+#   * 键不超过窗口长度（<=3600），单档状态数有界；
+#   * 计数沿用 count_arrangements 的语义（Python 大整数，不做模运算）；
+#   * 不与停播段相交、且与相邻节目（按流水号）首尾不相叠的候选才合法。
+# --------------------------------------------------------------------------- #
+def _recon_forward(
+    model: ArrangementModel, recon: Reconciliation
+) -> tuple[list[list[dict[int, int]]], list[list[int]]]:
+    """正向 DP。
+
+    返回 ``(fw, ends)``：``fw[i][j]`` 是节目 i 取候选 j 时，使前缀 0..i 合法、
+    且前缀窗口累计秒数为键的路径数字典；``ends[i][j]`` 为该候选的结束时刻。
+    非法（撞停播段）候选对应空字典。
+    """
+    fw: list[list[dict[int, int]]] = []
+    ends: list[list[int]] = []
+    prev_ends: list[int] | None = None
+    for i, program in enumerate(model.programs):
+        row: list[dict[int, int]] = []
+        end_row: list[int] = []
+        for start in program.starts:
+            end = start + program.duration
+            end_row.append(end)
+            if _hits_blackout(start, end, model.blackouts):
+                row.append({})
+                continue
+            gain = clipped_length(start, program.duration, recon.start, recon.end)
+            states: dict[int, int] = {}
+            if i == 0:
+                states[gain] = 1
+            else:
+                prev = model.programs[i - 1]
+                for k, prev_start in enumerate(prev.starts):
+                    if prev_ends is not None and prev_ends[k] <= start:
+                        for total, cnt in fw[i - 1][k].items():
+                            new_total = total + gain
+                            states[new_total] = states.get(new_total, 0) + cnt
+            row.append(states)
+        fw.append(row)
+        ends.append(end_row)
+        prev_ends = end_row
+    return fw, ends
+
+
+def _recon_backward(
+    model: ArrangementModel, recon: Reconciliation
+) -> list[list[dict[int, int]]]:
+    """后缀 DP：``bw[i][j]`` 为节目 i 取候选 j 时，后缀 i..n-1 合法、
+    且后缀窗口累计秒数为键的路径数。非法候选对应空字典。"""
+    n = len(model.programs)
+    bw: list[list[dict[int, int]]] = [[{} for _ in p.starts] for p in model.programs]
+    for i in range(n - 1, -1, -1):
+        program = model.programs[i]
+        for j, start in enumerate(program.starts):
+            end = start + program.duration
+            if _hits_blackout(start, end, model.blackouts):
+                continue
+            gain = clipped_length(start, program.duration, recon.start, recon.end)
+            states: dict[int, int] = {}
+            if i == n - 1:
+                states[gain] = 1
+            else:
+                nxt = model.programs[i + 1]
+                for k, next_start in enumerate(nxt.starts):
+                    if end <= next_start:
+                        for tail_total, cnt in bw[i + 1][k].items():
+                            new_total = gain + tail_total
+                            states[new_total] = states.get(new_total, 0) + cnt
+            bw[i][j] = states
+    return bw
+
+
+def count_matching_arrangements(
+    model: ArrangementModel, recon: Reconciliation
+) -> int:
+    """窗口总秒数恰等于 ``recon.on_air_seconds`` 的完整排法数量。
+
+    为 0 即表示不存在任何能对上监听记录的完整排法（对账单不予登记）。
+    """
+    if not model.programs:
+        # 没有节目时唯一的「空排法」窗口总秒数为 0。
+        return 1 if recon.on_air_seconds == 0 else 0
+    fw, _ = _recon_forward(model, recon)
+    total = 0
+    for states in fw[-1]:
+        total += states.get(recon.on_air_seconds, 0)
+    return total
+
+
+def effective_arrangement_count(
+    model: ArrangementModel, recon: Reconciliation | None
+) -> int:
+    """当前有效排法数：有对账单时只数对得上总秒数的完整排法，否则数全部。"""
+    if recon is None:
+        return count_arrangements(model)
+    return count_matching_arrangements(model, recon)
+
+
+def recon_query_second(
+    model: ArrangementModel, recon: Reconciliation, t: int
+) -> dict:
+    """在「对得上对账单总秒数」的完整排法子集上按秒查档。
+
+    * ``on_air``：在至少一种对得上总秒数的完整排法中播到秒 ``t`` 的节目流水号；
+    * ``may_be_gap``：是否存在一种对得上总秒数的完整排法，使 ``t`` 不被任何
+      节目覆盖（停播段内的秒恒为空档）；
+    * ``in_blackout``：``t`` 是否落在某个停播段内；
+    * ``arrangement_count``：对得上总秒数的完整排法数。
+    """
+    n = len(model.programs)
+    in_blackout = any(b.start <= t < b.end for b in model.blackouts)
+
+    if n == 0:
+        return {
+            "on_air": [],
+            "may_be_gap": True,
+            "in_blackout": in_blackout,
+            "arrangement_count": count_matching_arrangements(model, recon),
+        }
+
+    fw, ends = _recon_forward(model, recon)
+    bw = _recon_backward(model, recon)
+    target = recon.on_air_seconds
+
+    # on_air：存在候选 (i,j) 覆盖 t，且可拼出一条总和为 target 的完整排法。
+    # head（前缀 0..i，含本候选）与 suffix（后缀 i+1..n-1）各自合法，
+    # 还须校验 i 与 i+1 候选的边界不叠，二者才能拼成同一条完整排法。
+    on_air: list[int] = []
+    for i, program in enumerate(model.programs):
+        coverable = False
+        for j, start in enumerate(program.starts):
+            if not (start <= t < start + program.duration):
+                continue
+            end = ends[i][j]
+            for head_total, head_cnt in fw[i][j].items():
+                if not head_cnt:
+                    continue
+                need = target - head_total  # 后缀 i+1..n-1 需补足的窗口秒数
+                if i + 1 >= n:
+                    if need == 0:
+                        coverable = True
+                        break
+                    continue
+                nxt = model.programs[i + 1]
+                for k, next_start in enumerate(nxt.starts):
+                    if end > next_start:
+                        continue  # 与下一节目重叠，不能拼接
+                    if bw[i + 1][k].get(need, 0):
+                        coverable = True
+                        break
+                if coverable:
+                    break
+        if coverable:
+            on_air.append(program.seq)
+
+    # may_be_gap：正向 DP 额外携带「前缀排法是否已覆盖 t」两种状态。
+    # covered/uncovered[i][j]：到达候选 (i,j) 时窗口累计秒数 -> 路径数，
+    # 分别表示此前是否已有节目覆盖 t。
+    covered: list[list[dict[int, int]]] = []
+    uncovered: list[list[dict[int, int]]] = []
+    prev_ends: list[int] | None = None
+    for i, program in enumerate(model.programs):
+        cov_row: list[dict[int, int]] = []
+        unc_row: list[dict[int, int]] = []
+        for j, start in enumerate(program.starts):
+            end = ends[i][j]
+            if not fw[i][j]:  # 撞停播段的非法候选
+                cov_row.append({})
+                unc_row.append({})
+                continue
+            gain = clipped_length(start, program.duration, recon.start, recon.end)
+            covers = start <= t < end
+            cov_states: dict[int, int] = {}
+            unc_states: dict[int, int] = {}
+            if i == 0:
+                if covers:
+                    cov_states[gain] = 1
+                else:
+                    unc_states[gain] = 1
+            else:
+                prev = model.programs[i - 1]
+                for k, prev_start in enumerate(prev.starts):
+                    if prev_ends is not None and prev_ends[k] <= start:
+                        for total, cnt in covered[i - 1][k].items():
+                            nt = total + gain
+                            cov_states[nt] = cov_states.get(nt, 0) + cnt
+                        for total, cnt in uncovered[i - 1][k].items():
+                            nt = total + gain
+                            if covers:
+                                cov_states[nt] = cov_states.get(nt, 0) + cnt
+                            else:
+                                unc_states[nt] = unc_states.get(nt, 0) + cnt
+            cov_row.append(cov_states)
+            unc_row.append(unc_states)
+        covered.append(cov_row)
+        uncovered.append(unc_row)
+        prev_ends = ends[i]
+
+    gap_paths = 0
+    for states in uncovered[-1]:
+        gap_paths += states.get(target, 0)
+
+    return {
+        "on_air": on_air,
+        "may_be_gap": gap_paths > 0,
+        "in_blackout": in_blackout,
+        "arrangement_count": count_matching_arrangements(model, recon),
     }

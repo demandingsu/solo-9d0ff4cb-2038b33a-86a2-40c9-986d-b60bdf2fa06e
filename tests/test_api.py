@@ -90,6 +90,7 @@ def test_blackout_narrows_arrangements_and_removes_gap(client):
         "may_be_gap": True,
         "in_blackout": True,
         "arrangement_count": 1,
+        "reconciliation": None,
     }
     # 唯一排法里 06:30Z 的 P1 必播 -> 不可能空档
     r = client.get("/channels/ny-fm/query", params={"utc_second": 1730615400}).json()

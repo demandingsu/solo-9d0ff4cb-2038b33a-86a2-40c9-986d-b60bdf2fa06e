@@ -58,6 +58,40 @@ class BlackoutIn(BaseModel):
         return self
 
 
+class ReconciliationIn(BaseModel):
+    """值班员提交的对账单：核对窗口（UTC 秒，半开）与监听记录的在播总秒数。"""
+
+    start_utc: int = Field(..., description="核对窗口起点 UTC 纪元秒（含）")
+    end_utc: int = Field(..., description="核对窗口终点 UTC 纪元秒（不含），窗口最长 1 小时")
+    on_air_seconds: int = Field(..., ge=0, description="监听记录给出的窗口内在播总秒数")
+
+    @model_validator(mode="after")
+    def _window_rules(self) -> "ReconciliationIn":
+        if self.end_utc <= self.start_utc:
+            raise ValueError("核对窗口为半开区间 [start_utc, end_utc)，必须 end_utc > start_utc")
+        if self.end_utc - self.start_utc > 3600:
+            raise ValueError("核对窗口最长为 1 小时（3600 秒）")
+        if self.on_air_seconds > self.end_utc - self.start_utc:
+            raise ValueError("在播总秒数不能超过核对窗口长度")
+        return self
+
+
+class ReconciliationBrief(BaseModel):
+    """随档案/查档结果回显的当前对账单（每频道至多一张）。"""
+
+    start_utc: int
+    end_utc: int
+    on_air_seconds: int
+    matched_arrangement_count: int = Field(
+        ..., description="对得上该总秒数的完整排法数（即当前有效排法数）"
+    )
+
+
+class ReconciliationOut(ReconciliationBrief):
+    channel_id: str
+    version: int
+
+
 class ProgramOut(BaseModel):
     seq: int
     local_start: str
@@ -80,6 +114,7 @@ class ChannelOut(BaseModel):
     updated_at: str
     programs: list[ProgramOut]
     blackouts: list[BlackoutOut]
+    reconciliation: ReconciliationBrief | None = None
 
 
 class CommitOut(BaseModel):
@@ -97,3 +132,4 @@ class QueryOut(BaseModel):
     may_be_gap: bool
     in_blackout: bool
     arrangement_count: int
+    reconciliation: ReconciliationBrief | None = None
